@@ -3888,6 +3888,25 @@ document.addEventListener('keydown', e => {
 const SUPABASE_URL = 'https://jsopnuxslhhiafozbekj.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impzb3BudXhzbGhoaWFmb3piZWtqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3Mzg2ODUsImV4cCI6MjA5MzMxNDY4NX0.W-WRnzMkQvE3phYNDIornvf0DsCpW-pPZ0pIpkBp-Tg';
 
+// Módulos con número máximo de columnas fijo
+const MODULE_MAX_COLS = {
+  1: 8,
+  2: 8,
+};
+
+function sanitizeModuleColumns() {
+  Object.entries(MODULE_MAX_COLS).forEach(([idxStr, maxCols]) => {
+    const mod = DATA[parseInt(idxStr)];
+    if (!mod) return;
+    ['A','B','C'].forEach(nivel => {
+      mod.niveles[nivel] = mod.niveles[nivel].map(row => {
+        if (row.length > maxCols) return row.slice(0, maxCols);
+        return row;
+      });
+    });
+  });
+}
+
 async function supabaseFetch(method, body = null) {
   const opts = {
     method,
@@ -3924,21 +3943,38 @@ function buildSnapshot() {
 }
 
 function applySnapshot(snap) {
-  if (snap.data && Array.isArray(snap.data) && snap.data.length === DATA.length) {
-    snap.data.forEach((mod, i) => { if (DATA[i]) DATA[i].niveles = mod.niveles; });
+  // Soporta tanto claves de Supabase (minúsculas) como localStorage legacy (mayúsculas)
+  const modData = snap.data || snap.DATA;
+  const boxMeta = snap.box_meta || snap.BOX_META;
+  const movHistory = snap.movement_history || snap.MOVEMENT_HISTORY;
+  const delHistory = snap.deleted_history || snap.DELETED_HISTORY;
+  const estanteria = snap.estanteria || snap.ESTANTERIA;
+  const solicitudes = snap.solicitudes;
+  const solicLegacy = snap.SOLICITUDES;
+
+  if (modData && Array.isArray(modData) && modData.length === DATA.length) {
+    modData.forEach((mod, i) => { if (DATA[i] && mod.niveles) DATA[i].niveles = mod.niveles; });
   }
   sanitizeModuleColumns();
-  if (snap.estanteria) ESTANTERIA_DATA = snap.estanteria;
-  if (snap.box_meta) BOX_META = snap.box_meta;
-  if (snap.deleted_history) DELETED_HISTORY = snap.deleted_history;
-  if (snap.movement_history) MOVEMENT_HISTORY = snap.movement_history;
-  if (snap.solicitudes) {
-    if (snap.solicitudes.data) SOLICITUDES_DATA = snap.solicitudes.data;
-    if (typeof snap.solicitudes.manual_pato === 'number') MANUAL_PATO = snap.solicitudes.manual_pato;
-    if (typeof snap.solicitudes.manual_estudios === 'number') MANUAL_ESTUDIOS = snap.solicitudes.manual_estudios;
-    if (typeof snap.solicitudes.crecimiento_bimestral === 'number') CRECIMIENTO_BIMESTRAL = snap.solicitudes.crecimiento_bimestral;
-    if (snap.solicitudes.crecimiento_tipologia) CRECIMIENTO_TIPOLOGIA = snap.solicitudes.crecimiento_tipologia;
+  if (estanteria) ESTANTERIA_DATA = estanteria;
+  if (boxMeta) BOX_META = boxMeta;
+  if (delHistory && Array.isArray(delHistory)) DELETED_HISTORY = delHistory;
+  if (movHistory && Array.isArray(movHistory)) MOVEMENT_HISTORY = movHistory;
+
+  // Solicitudes desde Supabase (objeto anidado)
+  if (solicitudes) {
+    if (solicitudes.data) SOLICITUDES_DATA = solicitudes.data;
+    if (typeof solicitudes.manual_pato === 'number') MANUAL_PATO = solicitudes.manual_pato;
+    if (typeof solicitudes.manual_estudios === 'number') MANUAL_ESTUDIOS = solicitudes.manual_estudios;
+    if (typeof solicitudes.crecimiento_bimestral === 'number') CRECIMIENTO_BIMESTRAL = solicitudes.crecimiento_bimestral;
+    if (solicitudes.crecimiento_tipologia) CRECIMIENTO_TIPOLOGIA = solicitudes.crecimiento_tipologia;
   }
+  // Solicitudes legacy desde localStorage
+  if (solicLegacy) SOLICITUDES_DATA = solicLegacy;
+  if (typeof snap.MANUAL_PATO === 'number') MANUAL_PATO = snap.MANUAL_PATO;
+  if (typeof snap.MANUAL_ESTUDIOS === 'number') MANUAL_ESTUDIOS = snap.MANUAL_ESTUDIOS;
+  if (typeof snap.CRECIMIENTO_BIMESTRAL === 'number') CRECIMIENTO_BIMESTRAL = snap.CRECIMIENTO_BIMESTRAL;
+  if (snap.CRECIMIENTO_TIPOLOGIA) CRECIMIENTO_TIPOLOGIA = snap.CRECIMIENTO_TIPOLOGIA;
 }
 
 let _saveDebounce = null;
@@ -3967,16 +4003,16 @@ function saveToStorage() {
 async function loadFromStorage() {
   // Intentar cargar desde Supabase con timeout de 5 segundos
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(SUPABASE_URL + '/rest/v1/mapeo_estado?id=eq.singleton', {
-      signal: controller.signal,
+    const fetchPromise = fetch(SUPABASE_URL + '/rest/v1/mapeo_estado?id=eq.singleton', {
       headers: {
         'apikey': SUPABASE_KEY,
         'Authorization': 'Bearer ' + SUPABASE_KEY,
       }
     });
-    clearTimeout(timeout);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), 5000)
+    );
+    const res = await Promise.race([fetchPromise, timeoutPromise]);
     if (res.ok) {
       const rows = await res.json();
       if (rows && rows.length > 0) {
@@ -3989,9 +4025,7 @@ async function loadFromStorage() {
         }
       }
     }
-  } catch(e) {
-    console.warn('Supabase no disponible:', e.message);
-  }
+  } catch(e) { /* Supabase no disponible — usando fallback */ }
 
   // Fallback 1: localStorage
   try {
@@ -4002,11 +4036,9 @@ async function loadFromStorage() {
       updateStorageBadge(true);
       return true;
     }
-  } catch(e) {
-    console.warn('localStorage falló:', e);
-  }
+  } catch(e) { /* silencioso */ }
 
-  // Fallback 2: usar DATA por defecto (app funciona sin datos guardados)
+  // Fallback 2: datos por defecto
   updateStorageBadge(false);
   return false;
 }
@@ -5677,62 +5709,6 @@ function exportToExcel() {
 // INIT
 // ══════════════════════════════════════════════════════════════
 
-(function showLoadingOverlay() {
-  const ov = document.createElement('div');
-  ov.id = 'supabase-loading';
-  ov.style.cssText = 'position:fixed;inset:0;background:#0d3333;z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;';
-  ov.innerHTML = `<div style="width:44px;height:44px;border:4px solid rgba(255,255,255,0.15);border-top-color:#00d4aa;border-radius:50%;animation:spin 0.8s linear infinite"></div>
-    <div style="color:#fff;font-family:DM Sans,sans-serif;font-size:14px;font-weight:600">Cargando datos...</div>
-    <style>@keyframes spin{to{transform:rotate(360deg)}}</style>`;
-  document.body.appendChild(ov);
-})();
-
-(async function initApp() {
-  // Timeout de seguridad: si algo falla, quitar overlay en máximo 6 segundos
-  const safetyTimer = setTimeout(() => {
-    const ov = document.getElementById('supabase-loading');
-    if (ov) ov.remove();
-  }, 6000);
-
-  await loadFromStorage();
-
-  clearTimeout(safetyTimer);
-  // Quitar overlay de carga
-  const ov = document.getElementById('supabase-loading');
-  if (ov) ov.remove();
-
-  buildSidebar();
-  updateAvailCountPill();
-  renderDeletedHistory();
-  updateMovPill();
-  updateFechasPill();
-
-  // Chevron animado para el historial desplegable
-  const _histDetails = document.getElementById('deletedHistoryDetails');
-  if (_histDetails) {
-    _histDetails.addEventListener('toggle', () => {
-      const ch = document.getElementById('deletedHistoryChevron');
-      if (ch) ch.style.transform = _histDetails.open ? 'rotate(180deg)' : 'rotate(0deg)';
-    });
-  }
-
-  // Polling cada 30s para el invitado: ver cambios del admin en tiempo real
-  if (SESSION && SESSION.rol === 'viewer') {
-    setInterval(async () => {
-      try {
-        const rows = await supabaseFetch('GET');
-        if (rows && rows.length > 0 && rows[0].data && rows[0].data.length > 0) {
-          applySnapshot(rows[0]);
-          buildSidebar();
-          updateAvailCountPill();
-          updateMovPill();
-          if (typeof updateElimCount === 'function') updateElimCount();
-        }
-      } catch(e) { /* silencioso */ }
-    }, 30000);
-  }
-})();
-
 function buildIndex() {
   const index = [];
   DATA.forEach((mod, idx) => {
@@ -5751,6 +5727,63 @@ function buildIndex() {
 }
 
 let INDEX = buildIndex();
+
+(function showLoadingOverlay() {
+  const ov = document.createElement('div');
+  ov.id = 'supabase-loading';
+  ov.style.cssText = 'position:fixed;inset:0;background:#0d3333;z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;';
+  ov.innerHTML = `<div style="width:44px;height:44px;border:4px solid rgba(255,255,255,0.15);border-top-color:#00d4aa;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+    <div style="color:#fff;font-family:DM Sans,sans-serif;font-size:14px;font-weight:600">Cargando datos...</div>
+    <style>@keyframes spin{to{transform:rotate(360deg)}}</style>`;
+  document.body.appendChild(ov);
+})();
+
+(async function initApp() {
+  const safetyTimer = setTimeout(() => {
+    const ov = document.getElementById('supabase-loading');
+    if (ov) ov.remove();
+  }, 6000);
+
+  await loadFromStorage();
+
+  clearTimeout(safetyTimer);
+  const ov = document.getElementById('supabase-loading');
+  if (ov) ov.remove();
+
+  // Reconstruir índice con datos cargados
+  INDEX = buildIndex();
+
+  buildSidebar();
+  updateAvailCountPill();
+  renderDeletedHistory();
+  updateMovPill();
+  updateFechasPill();
+
+  const _histDetails = document.getElementById('deletedHistoryDetails');
+  if (_histDetails) {
+    _histDetails.addEventListener('toggle', () => {
+      const ch = document.getElementById('deletedHistoryChevron');
+      if (ch) ch.style.transform = _histDetails.open ? 'rotate(180deg)' : 'rotate(0deg)';
+    });
+  }
+
+  // Polling cada 30s para el invitado
+  if (SESSION && SESSION.rol === 'viewer') {
+    setInterval(async () => {
+      try {
+        const rows = await supabaseFetch('GET');
+        if (rows && rows.length > 0 && rows[0].data && rows[0].data.length > 0) {
+          applySnapshot(rows[0]);
+          INDEX = buildIndex();
+          buildSidebar();
+          updateAvailCountPill();
+          updateMovPill();
+          if (typeof updateElimCount === 'function') updateElimCount();
+        }
+      } catch(e) { /* silencioso */ }
+    }, 30000);
+  }
+})();
 
 document.getElementById('searchInput').addEventListener('input', function() {
   INDEX = buildIndex(); // refresh index to pick up edits
@@ -8449,5 +8482,6 @@ document.getElementById('multiStatusModal').addEventListener('click', e => {
 
 </body>
 </html>
+
 
 
